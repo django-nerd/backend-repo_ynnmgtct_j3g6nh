@@ -1,8 +1,8 @@
 import os
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -226,6 +226,157 @@ def chat(req: ChatRequest):
         return ChatResponse(answer=answer)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# --------- PDF Statement Upload & Parse ---------
+
+def _parse_date(text: str) -> Optional[datetime]:
+    from datetime import datetime
+    import re
+    # Supports: DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d %b %Y", "%d %B %Y"):
+        try:
+            return datetime.strptime(text.strip(), fmt)
+        except Exception:
+            pass
+    # Try detect like 01/02/23
+    m = __import__('re').match(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{2})$", text.strip())
+    if m:
+        d, mth, y = m.groups()
+        y = int(y)
+        y = 2000 + y if y < 70 else 1900 + y
+        try:
+            return datetime(int(y), int(mth), int(d))
+        except Exception:
+            return None
+    return None
+
+
+def _infer_channel(desc: str) -> str:
+    d = (desc or "").lower()
+    if any(k in d for k in ["upi", "gpay", "phonepe", "paytm", "bharatpe"]):
+        return "upi"
+    if any(k in d for k in ["visa", "master", "card", "pos", "swipe"]):
+        return "card"
+    if any(k in d for k in ["imps", "neft", "rtgs"]):
+        return "netbanking"
+    if any(k in d for k in ["salary", "ach", "ecs"]):
+        return "ach"
+    return "other"
+
+
+def _infer_category(desc: str) -> str:
+    d = (desc or "").lower()
+    if any(k in d for k in ["grocery", "bigbazaar", "dmart", "supermart"]):
+        return "Groceries"
+    if any(k in d for k in ["uber", "ola", "metro", "fuel", "petrol", "diesel"]):
+        return "Transport"
+    if any(k in d for k in ["zomato", "swiggy", "restaurant", "cafe", "food"]):
+        return "Food"
+    if any(k in d for k in ["amazon", "flipkart", "myntra", "shopping"]):
+        return "Shopping"
+    if any(k in d for k in ["electric", "water", "gas", "dth", "mobile", "broadband"]):
+        return "Utilities"
+    if any(k in d for k in ["salary", "refund", "reversal", "cashback"]):
+        return "Income"
+    return "Uncategorized"
+
+
+@app.post("/ingest/statement/pdf")
+async def ingest_statement_pdf(
+    file: UploadFile = File(...),
+    account_name: str = Form("Uploaded Statement"),
+    account_type: str = Form("checking"),
+    currency: str = Form("INR"),
+    user_id: Optional[str] = Form(None),
+):
+    try:
+        import io
+        import pdfplumber
+        content = await file.read()
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            lines: List[str] = []
+            for page in pdf.pages:
+                txt = page.extract_text() or ""
+                for ln in txt.splitlines():
+                    # normalize spaces
+                    lines.append(" ".join(ln.split()))
+        # Heuristic parse: expect lines with date and amount towards end
+        import re
+        txns: List[Dict[str, Any]] = []
+        date_pat = re.compile(r"^(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}|\d{1,2} [A-Za-z]{3,} \d{4})")
+        amount_pat = re.compile(r"([-+]?[\d,]+(?:\.\d{1,2})?)\s*(Cr|Dr)?$", re.IGNORECASE)
+        for ln in lines:
+            ln = ln.strip()
+            if not ln:
+                continue
+            dm = date_pat.match(ln)
+            am = amount_pat.search(ln)
+            if not dm or not am:
+                continue
+            date_str = dm.group(1)
+            rest = ln[dm.end():].strip()
+            # Description typically between date and amount
+            desc = rest[:am.start()].strip()
+            amt_str = am.group(1)
+            crdr = (am.group(2) or "").lower()
+            # Clean amount
+            try:
+                amt = float(amt_str.replace(",", ""))
+            except Exception:
+                continue
+            # Debit negative, Credit positive (common convention)
+            if crdr == "dr":
+                amt = -abs(amt)
+            elif crdr == "cr":
+                amt = abs(amt)
+            else:
+                # Fallback: infer sign by keywords
+                amt = -abs(amt) if any(k in desc.lower() for k in ["pos", "upi", "debit", "purchase", "spent"]) else abs(amt)
+            dt = _parse_date(date_str)
+            if not dt:
+                continue
+            txns.append({
+                "user_id": user_id,
+                "account_id": None,
+                "amount": amt,
+                "currency": currency,
+                "date": dt,
+                "description": desc or "Transaction",
+                "category": _infer_category(desc),
+                "channel": _infer_channel(desc),
+            })
+        # Create/find institution & account
+        inst = db["institution"].find_one({"name": "Uploaded PDF"})
+        if not inst:
+            inst_id = create_document("institution", {"name": "Uploaded PDF", "type": "other"})
+        else:
+            inst_id = str(inst["_id"]) if "_id" in inst else inst.get("id")
+        acct = db["account"].find_one({"name": account_name})
+        if not acct:
+            acct_id = create_document("account", {
+                "user_id": user_id,
+                "name": account_name,
+                "type": account_type,
+                "currency": currency,
+                "balance": 0.0,
+                "institution_id": inst_id,
+                "last_synced_at": datetime.utcnow(),
+            })
+        else:
+            acct_id = str(acct["_id"]) if "_id" in acct else acct.get("id")
+        # Insert transactions
+        inserted = 0
+        for t in txns:
+            t["account_id"] = acct_id
+            try:
+                create_document("transaction", t)
+                inserted += 1
+            except Exception:
+                continue
+        return {"status": "ok", "inserted": inserted, "parsed": len(txns)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to parse PDF: {e}")
 
 
 # Utility endpoint to seed sample data for demo
