@@ -1,17 +1,16 @@
 INFO:     Will watch for changes in these directories: ['/home/workspace']
 INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
-INFO:     Started reloader process [337] using StatReload
-INFO:     Started server process [339]
+INFO:     Started reloader process [420] using StatReload
+INFO:     Started server process [422]
 INFO:     Waiting for application startup.
 INFO:     Application startup complete.
-INFO:     172.20.0.1:53498 - "HEAD / HTTP/1.1" 405 Method Not Allowed
-INFO:     172.20.0.1:53480 - "GET /dashboard/summary HTTP/1.1" 200 OK
-INFO:     172.20.0.1:53496 - "GET /dashboard/summary HTTP/1.1" 200 OK
-INFO:     172.20.0.1:53496 - "GET /dashboard/summary HTTP/1.1" 200 OK
-INFO:     172.20.0.1:53480 - "GET /dashboard/summary HTTP/1.1" 200 OK
-INFO:     172.20.0.1:44894 - "GET /dashboard/summary HTTP/1.1" 200 OK
-INFO:     172.20.0.1:44900 - "GET /dashboard/summary HTTP/1.1" 200 OK
-INFO:     172.20.0.1:44894 - "GET /dashboard/summary HTTP/1.1" 200 OK
-INFO:     172.20.0.1:44900 - "GET /dashboard/summary HTTP/1.1" 200 OK
-INFO:     172.20.0.1:43394 - "POST /ingest/statement/pdf HTTP/1.1" 200 OK
-INFO:     172.20.0.1:36280 - "POST /ingest/statement/pdf HTTP/1.1" 200 OK
+INFO:     172.20.0.1:42916 - "HEAD / HTTP/1.1" 405 Method Not Allowed
+INFO:     172.20.0.1:42914 - "GET /dashboard/summary HTTP/1.1" 200 OK
+INFO:     172.20.0.1:42908 - "GET /dashboard/summary HTTP/1.1" 200 OK
+INFO:     172.20.0.1:42908 - "GET /dashboard/summary HTTP/1.1" 200 OK
+INFO:     172.20.0.1:42914 - "GET /dashboard/summary HTTP/1.1" 200 OK
+INFO:     172.20.0.1:40252 - "GET /dashboard/summary HTTP/1.1" 200 OK
+INFO:     172.20.0.1:40264 - "GET /dashboard/summary HTTP/1.1" 200 OK
+INFO:     172.20.0.1:40252 - "GET /dashboard/summary HTTP/1.1" 200 OK
+INFO:     172.20.0.1:40264 - "GET /dashboard/summary HTTP/1.1" 200 OK
+INFO:     172.20.0.1:50396 - "POST /ingest/statement/pdf HTTP/1.1" 200 OK

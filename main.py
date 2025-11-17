@@ -233,7 +233,7 @@ def chat(req: ChatRequest):
 def _parse_date(text: str) -> Optional[datetime]:
     from datetime import datetime
     import re
-    # Supports: DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD
+    # Supports: DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD, '01 Jan 2024'
     for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d %b %Y", "%d %B %Y"):
         try:
             return datetime.strptime(text.strip(), fmt)
@@ -252,34 +252,14 @@ def _parse_date(text: str) -> Optional[datetime]:
     return None
 
 
-def _infer_channel(desc: str) -> str:
-    d = (desc or "").lower()
-    if any(k in d for k in ["upi", "gpay", "phonepe", "paytm", "bharatpe"]):
-        return "upi"
-    if any(k in d for k in ["visa", "master", "card", "pos", "swipe"]):
-        return "card"
-    if any(k in d for k in ["imps", "neft", "rtgs"]):
-        return "netbanking"
-    if any(k in d for k in ["salary", "ach", "ecs"]):
-        return "ach"
-    return "other"
+def _infer_channel(desc: str) -> Optional[str]:
+    # For exactness, do not infer; return None
+    return None
 
 
-def _infer_category(desc: str) -> str:
-    d = (desc or "").lower()
-    if any(k in d for k in ["grocery", "bigbazaar", "dmart", "supermart"]):
-        return "Groceries"
-    if any(k in d for k in ["uber", "ola", "metro", "fuel", "petrol", "diesel"]):
-        return "Transport"
-    if any(k in d for k in ["zomato", "swiggy", "restaurant", "cafe", "food"]):
-        return "Food"
-    if any(k in d for k in ["amazon", "flipkart", "myntra", "shopping"]):
-        return "Shopping"
-    if any(k in d for k in ["electric", "water", "gas", "dth", "mobile", "broadband"]):
-        return "Utilities"
-    if any(k in d for k in ["salary", "refund", "reversal", "cashback"]):
-        return "Income"
-    return "Uncategorized"
+def _infer_category(desc: str) -> Optional[str]:
+    # For exactness, do not infer; return None
+    return None
 
 
 @app.post("/ingest/statement/pdf")
@@ -292,6 +272,8 @@ async def ingest_statement_pdf(
 ):
     try:
         import io
+        import re
+        from decimal import Decimal, InvalidOperation
         import pdfplumber
         content = await file.read()
         with pdfplumber.open(io.BytesIO(content)) as pdf:
@@ -299,53 +281,82 @@ async def ingest_statement_pdf(
             for page in pdf.pages:
                 txt = page.extract_text() or ""
                 for ln in txt.splitlines():
-                    # normalize spaces
-                    lines.append(" ".join(ln.split()))
-        # Heuristic parse: expect lines with date and amount towards end
-        import re
+                    lines.append(" ".join(ln.split()))  # normalize spaces only
+        # Strict parse: require explicit Dr/Cr markers OR separate debit/credit columns
         txns: List[Dict[str, Any]] = []
         date_pat = re.compile(r"^(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}|\d{1,2} [A-Za-z]{3,} \d{4})")
-        amount_pat = re.compile(r"([-+]?[\d,]+(?:\.\d{1,2})?)\s*(Cr|Dr)?$", re.IGNORECASE)
-        for ln in lines:
-            ln = ln.strip()
+        # amount token matcher (no sign inference here)
+        amt_token = re.compile(r"([\d,]+(?:\.\d{1,2})?)")
+        crdr_token = re.compile(r"\b(CR|Cr|cr|DR|Dr|dr)\b")
+        inserted = 0
+        parsed = 0
+        skipped_no_marker = 0
+
+        for raw in lines:
+            ln = raw.strip()
             if not ln:
                 continue
             dm = date_pat.match(ln)
-            am = amount_pat.search(ln)
-            if not dm or not am:
+            if not dm:
                 continue
             date_str = dm.group(1)
             rest = ln[dm.end():].strip()
-            # Description typically between date and amount
-            desc = rest[:am.start()].strip()
-            amt_str = am.group(1)
-            crdr = (am.group(2) or "").lower()
-            # Clean amount
-            try:
-                amt = float(amt_str.replace(",", ""))
-            except Exception:
-                continue
-            # Debit negative, Credit positive (common convention)
-            if crdr == "dr":
-                amt = -abs(amt)
-            elif crdr == "cr":
-                amt = abs(amt)
+            # Find all amount-like tokens at end
+            tokens = amt_token.findall(rest)
+            crdr_match = list(crdr_token.finditer(rest))
+
+            amount: Optional[Decimal] = None
+            sign: Optional[int] = None  # +1 credit, -1 debit
+
+            # Case 1: explicit CR/DR marker near end with one amount
+            if crdr_match:
+                marker = crdr_match[-1].group(0).lower()
+                sign = 1 if marker.startswith('cr') else -1
+                # amount should be the last numeric token before/around the marker
+                if tokens:
+                    try:
+                        amount = Decimal(tokens[-1].replace(',', ''))
+                    except InvalidOperation:
+                        amount = None
             else:
-                # Fallback: infer sign by keywords
-                amt = -abs(amt) if any(k in desc.lower() for k in ["pos", "upi", "debit", "purchase", "spent"]) else abs(amt)
-            dt = _parse_date(date_str)
+                # Case 2: statements with separate debit/credit columns where one is blank ('-')
+                # Heuristic without guessing sign: if there are exactly 2 numeric tokens at end, and text contains keywords 'Debit'/'Credit' headers are not present per line post-OCR,
+                # we cannot be 100% sure which is which. To keep exactness, we SKIP such lines.
+                amount = None
+                sign = None
+
+            if amount is None or sign is None:
+                skipped_no_marker += 1
+                continue
+
+            try:
+                dt = _parse_date(date_str)
+            except Exception:
+                dt = None
             if not dt:
                 continue
+
+            # Description is rest with marker and trailing amount removed
+            # We'll take substring up to the start of the last marker occurrence
+            desc_end_idx = crdr_match[-1].start() if crdr_match else len(rest)
+            description = rest[:desc_end_idx].strip()
+            if not description:
+                description = "Transaction"
+
+            amt_signed = (amount * (1 if sign == 1 else -1))
+            parsed += 1
+
             txns.append({
                 "user_id": user_id,
                 "account_id": None,
-                "amount": amt,
+                "amount": float(amt_signed),  # stored as float in DB; parsed exactly via Decimal first
                 "currency": currency,
                 "date": dt,
-                "description": desc or "Transaction",
-                "category": _infer_category(desc),
-                "channel": _infer_channel(desc),
+                "description": description,
+                "category": _infer_category(description),  # None for exactness
+                "channel": _infer_channel(description),    # None for exactness
             })
+
         # Create/find institution & account
         inst = db["institution"].find_one({"name": "Uploaded PDF"})
         if not inst:
@@ -366,7 +377,6 @@ async def ingest_statement_pdf(
         else:
             acct_id = str(acct["_id"]) if "_id" in acct else acct.get("id")
         # Insert transactions
-        inserted = 0
         for t in txns:
             t["account_id"] = acct_id
             try:
@@ -374,7 +384,7 @@ async def ingest_statement_pdf(
                 inserted += 1
             except Exception:
                 continue
-        return {"status": "ok", "inserted": inserted, "parsed": len(txns)}
+        return {"status": "ok", "inserted": inserted, "parsed": parsed, "skipped_no_marker": skipped_no_marker}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to parse PDF: {e}")
 
