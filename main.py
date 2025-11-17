@@ -127,26 +127,27 @@ def ingest_institution(payload: IngestInstitution):
 # --------- Dashboard Queries ---------
 class DashboardSummary(BaseModel):
     total_balance: float
-    inflow_30d: float
-    outflow_30d: float
+    inflow_lookback: float
+    outflow_lookback: float
     by_channel: Dict[str, float]
     by_category: Dict[str, float]
 
 
 @app.get("/dashboard/summary", response_model=DashboardSummary)
-def dashboard_summary(user_id: Optional[str] = Query(None)):
+def dashboard_summary(user_id: Optional[str] = Query(None), days: int = Query(30, ge=0)):
     try:
-        # Balances
+        # Balances (sum of account balances if present)
         acct_filter = {"user_id": user_id} if user_id else {}
         accounts = get_documents("account", acct_filter)
         total_balance = sum(float(a.get("balance", 0) or 0) for a in accounts)
 
-        # Transactions last 30 days
-        from datetime import datetime, timedelta
-
-        now = datetime.utcnow()
-        start = now - timedelta(days=30)
-        tx_filter: Dict[str, Any] = {"date": {"$gte": start}}
+        # Transactions lookback window
+        tx_filter: Dict[str, Any] = {}
+        if days and days > 0:
+            from datetime import timedelta
+            now = datetime.utcnow()
+            start = now - timedelta(days=days)
+            tx_filter["date"] = {"$gte": start}
         if user_id:
             tx_filter["user_id"] = user_id
         txs = list(db["transaction"].find(tx_filter))
@@ -165,8 +166,8 @@ def dashboard_summary(user_id: Optional[str] = Query(None)):
 
         return DashboardSummary(
             total_balance=round(total_balance, 2),
-            inflow_30d=round(inflow, 2),
-            outflow_30d=round(outflow, 2),
+            inflow_lookback=round(inflow, 2),
+            outflow_lookback=round(outflow, 2),
             by_channel={k: round(v, 2) for k, v in by_channel.items()},
             by_category={k: round(v, 2) for k, v in by_category.items()},
         )
@@ -192,24 +193,24 @@ def synthesize_answer(question: str, summary: DashboardSummary) -> str:
     # In a real app, replace with an LLM call.
     q = question.lower()
     if "spent" in q or "outflow" in q or "expenses" in q:
-        return f"You've spent approximately ₹{summary.outflow_30d:.2f} in the last 30 days. Top categories: " + \
+        return f"You've spent approximately ₹{summary.outflow_lookback:.2f} in the selected period. Top categories: " + \
             ", ".join(sorted(summary.by_category, key=summary.by_category.get, reverse=True)[:3])
     if "saved" in q or "surplus" in q or "left" in q or "balance" in q:
-        net = summary.inflow_30d - summary.outflow_30d
-        return f"Your current combined balance is ~₹{summary.total_balance:.2f}. Net over 30 days: ₹{net:.2f}."
+        net = summary.inflow_lookback - summary.outflow_lookback
+        return f"Your current combined balance is ~₹{summary.total_balance:.2f}. Net over period: ₹{net:.2f}."
     if "upi" in q:
         upi = summary.by_channel.get("upi", 0.0)
-        return f"UPI volume over the last month is about ₹{upi:.2f}."
+        return f"UPI volume over the selected period is about ₹{upi:.2f}."
     if "credit" in q or "card" in q:
         card = summary.by_channel.get("card", 0.0)
-        return f"Card transactions total roughly ₹{card:.2f} in the last 30 days."
+        return f"Card transactions total roughly ₹{card:.2f} in the selected period."
     # Default
     return dedent(
         f"""
-        Here's a quick snapshot for the last 30 days:
+        Here's a quick snapshot for the selected period:
         - Combined balance: ₹{summary.total_balance:.2f}
-        - Inflow: ₹{summary.inflow_30d:.2f}
-        - Outflow: ₹{summary.outflow_30d:.2f}
+        - Inflow: ₹{summary.inflow_lookback:.2f}
+        - Outflow: ₹{summary.outflow_lookback:.2f}
         Top categories: {', '.join(sorted(summary.by_category, key=summary.by_category.get, reverse=True)[:3]) or 'N/A'}
         """
     ).strip()
@@ -218,8 +219,8 @@ def synthesize_answer(question: str, summary: DashboardSummary) -> str:
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
     try:
-        summary = dashboard_summary(user_id=req.user_id)  # reuse logic
-        # If FastAPI returns model, ensure we have object
+        # Use a wider default window for chat insights
+        summary = dashboard_summary(user_id=req.user_id, days=365)  # reuse logic
         if isinstance(summary, dict):
             summary = DashboardSummary(**summary)
         answer = synthesize_answer(req.question, summary)
@@ -319,9 +320,7 @@ async def ingest_statement_pdf(
                     except InvalidOperation:
                         amount = None
             else:
-                # Case 2: statements with separate debit/credit columns where one is blank ('-')
-                # Heuristic without guessing sign: if there are exactly 2 numeric tokens at end, and text contains keywords 'Debit'/'Credit' headers are not present per line post-OCR,
-                # we cannot be 100% sure which is which. To keep exactness, we SKIP such lines.
+                # Without explicit markers we skip to keep exactness
                 amount = None
                 sign = None
 
@@ -337,7 +336,6 @@ async def ingest_statement_pdf(
                 continue
 
             # Description is rest with marker and trailing amount removed
-            # We'll take substring up to the start of the last marker occurrence
             desc_end_idx = crdr_match[-1].start() if crdr_match else len(rest)
             description = rest[:desc_end_idx].strip()
             if not description:
@@ -357,13 +355,13 @@ async def ingest_statement_pdf(
                 "channel": _infer_channel(description),    # None for exactness
             })
 
-        # Create/find institution & account
+        # Create/find institution & account for this user
         inst = db["institution"].find_one({"name": "Uploaded PDF"})
         if not inst:
             inst_id = create_document("institution", {"name": "Uploaded PDF", "type": "other"})
         else:
             inst_id = str(inst["_id"]) if "_id" in inst else inst.get("id")
-        acct = db["account"].find_one({"name": account_name})
+        acct = db["account"].find_one({"name": account_name, "user_id": user_id}) if user_id else db["account"].find_one({"name": account_name})
         if not acct:
             acct_id = create_document("account", {
                 "user_id": user_id,
